@@ -21,14 +21,10 @@ def get_global_app_state():
     """Initializes and returns the global state dictionary."""
     return {
         "monitored_servers": [],  # List of {'name': str, 'url': str, 'config_cache': None}
-        "refresh_interval_label": "10s", # Default refresh interval
         "top_n_processes": 3, # Default Top-N processes
     }
 
 GLOBAL_APP_STATE = get_global_app_state()
-
-# Map refresh labels to seconds for auto-refresh and TTL logic
-REFRESH_INTERVALS_MAP = {"Off": 0, "1s": 1, "5s": 5, "10s": 10, "30s": 30, "60s": 60}
 
 # --- Helper Function to Call Backend API ---
 def fetch_from_api_server(base_url: str, endpoint: str, params: dict = None):
@@ -56,90 +52,46 @@ def fetch_from_api_server(base_url: str, endpoint: str, params: dict = None):
 @st.cache_data(ttl=3600) # Cache config for 1 hour
 def get_server_config_cached(server_url: str):
     """Fetches and caches server configuration."""
-    # print(f"Fetching CONFIG from {server_url} at {time.time()}") # Debug
     return fetch_from_api_server(server_url, "/api/server/config")
 
-# For dynamic data, use a short, fixed TTL.
-# Auto-refresh will trigger reruns, and if data is older than this TTL, it will be refetched.
-# This avoids the complexity and potential bugs of dynamically callable TTLs with st.cache_data.
-FIXED_DYNAMIC_DATA_TTL = 1.0 # Cache dynamic data for 1 second
-
-@st.cache_data(ttl=FIXED_DYNAMIC_DATA_TTL)
+# For dynamic data
+@st.cache_data(ttl=1.0)
 def fetch_status_cached(base_url: str, top_n_gpu_processes: int):
     """Fetches and caches real-time server status."""
-    # print(f"Fetching STATUS from {base_url} (top_n_gpu={top_n_gpu_processes}) at {time.time()}") # Debug
     return fetch_from_api_server(base_url, "/api/server/status", params={"top_n_gpu_processes": top_n_gpu_processes})
 
-@st.cache_data(ttl=FIXED_DYNAMIC_DATA_TTL)
+@st.cache_data(ttl=1.0)
 def fetch_cpu_processes_cached(base_url: str, n: int):
     """Fetches and caches top CPU processes."""
-    # print(f"Fetching CPU_PROCS from {base_url} (n={n}) at {time.time()}") # Debug
     return fetch_from_api_server(base_url, "/api/cpu/top_processes", params={"n": n})
 
 
 # --- Sidebar for Global Controls & Server Management ---
 st.sidebar.header("⚙️ Global Controls")
 
-# Refresh Interval
-current_refresh_label = GLOBAL_APP_STATE["refresh_interval_label"]
-refresh_options = list(REFRESH_INTERVALS_MAP.keys())
-selected_interval_label = st.sidebar.selectbox(
-    "Refresh Interval",
-    options=refresh_options,
-    index=refresh_options.index(current_refresh_label), # Pre-select current global setting
-    help="Global: How often to refresh data for all servers. Affects all users viewing this app."
-)
-if selected_interval_label != current_refresh_label:
-    GLOBAL_APP_STATE["refresh_interval_label"] = selected_interval_label
-    # Clear dynamic data caches when refresh interval changes, as their effective freshness requirement changes.
-    fetch_status_cached.clear()
-    fetch_cpu_processes_cached.clear()
-    st.rerun() # Rerun to apply new interval and re-trigger auto-refresh
-
-refresh_interval_seconds = REFRESH_INTERVALS_MAP[GLOBAL_APP_STATE["refresh_interval_label"]]
-
-# Implement manual refresh if set to auto-refresh
-if refresh_interval_seconds > 0:
-    # Create a placeholder for the auto-refresh functionality
-    refresh_placeholder = st.empty()
-    # Store the last refresh time in session state
-    if "last_refresh_time" not in st.session_state:
-        st.session_state.last_refresh_time = time.time()
-        st.session_state.refresh_counter = 0
-
-    # Check if it's time to refresh
-    current_time = time.time()
-    if current_time - st.session_state.last_refresh_time >= refresh_interval_seconds:
-        st.session_state.last_refresh_time = current_time
-        st.session_state.refresh_counter += 1
-        # Clear caches to force data refresh
-        fetch_status_cached.clear()
-        fetch_cpu_processes_cached.clear()
-
-    # Display last refresh info
-    refresh_placeholder.caption(f"Auto-refresh active ({refresh_interval_seconds}s). Last refresh: {time.strftime('%H:%M:%S', time.localtime(st.session_state.last_refresh_time))}")
-
-    # Add a manual refresh button
-    if st.sidebar.button("🔄 Refresh Now"):
-        fetch_status_cached.clear()
-        fetch_cpu_processes_cached.clear()
-        st.session_state.last_refresh_time = time.time()
-        st.session_state.refresh_counter += 1
-        st.rerun()
-
 # Top N Processes
 current_top_n = GLOBAL_APP_STATE["top_n_processes"]
-top_n_options = [1, 2, 3, 4, 5, 10]
-selected_top_n = st.sidebar.selectbox(
-    "Top N Processes",
-    options=top_n_options,
-    index=top_n_options.index(current_top_n if current_top_n in top_n_options else 3), # Default to 3 if not in list
-    help="Global: Number of top CPU/GPU processes to display. Affects all users."
+# Use a number input instead of dropdown to allow custom values
+top_n = st.sidebar.number_input(
+    "Number of Top Processes to Display",
+    min_value=1,
+    max_value=20,
+    value=current_top_n,
+    step=1,
+    help="Number of top CPU/GPU processes to display for each server."
 )
-if selected_top_n != current_top_n:
-    GLOBAL_APP_STATE["top_n_processes"] = selected_top_n
-    # Clear caches that depend on top_n if it changes
-    fetch_status_cached.clear() # GPU processes depend on top_n via API param (indirectly through global state)
+
+if top_n != current_top_n:
+    GLOBAL_APP_STATE["top_n_processes"] = top_n
+    # Clear caches that depend on top_n
+    fetch_status_cached.clear()
+    fetch_cpu_processes_cached.clear()
+    st.rerun()
+
+# Manual refresh button
+if st.sidebar.button("🔄 Refresh Data Now"):
+    # Clear all dynamic data caches to force fresh data fetching
+    fetch_status_cached.clear()
     fetch_cpu_processes_cached.clear()
     st.rerun()
 
@@ -166,11 +118,9 @@ with st.sidebar.form("add_server_form", clear_on_submit=True):
             else:
                 # Test connection by fetching config before adding
                 st.sidebar.info(f"Trying to connect to {cleaned_url}...")
-                test_config = fetch_from_api_server(cleaned_url, "/api/server/config") # Use the generic fetcher
+                test_config = fetch_from_api_server(cleaned_url, "/api/server/config")
 
                 if test_config and "error" not in test_config:
-                    # Optionally, cache this initial config fetch directly if useful
-                    # server_info_entry['config_cache'] = test_config
                     GLOBAL_APP_STATE["monitored_servers"].append(
                         {'name': new_server_name, 'url': cleaned_url}
                     )
@@ -194,9 +144,6 @@ if GLOBAL_APP_STATE["monitored_servers"]:
     if servers_to_remove_indices:
         for i in sorted(servers_to_remove_indices, reverse=True): # Remove from end to keep indices valid
             removed_server = GLOBAL_APP_STATE["monitored_servers"].pop(i)
-            # Clear caches associated with this server URL if desired, though they'll expire or be unused
-            # For example: get_server_config_cached.clear() - but this clears for all args.
-            # Fine-grained clearing by arg is more complex; simpler to let them expire.
             st.sidebar.toast(f"Removed server: {removed_server['name']}")
         st.rerun() # Rerun to reflect removed server
 
@@ -231,7 +178,7 @@ def display_server_data(server_info: dict, top_n_global: int):
                 for i, gpu in enumerate(gpus_cfg):
                     st.markdown(f"--- \n **GPU {gpu.get('id','N/A')}: {gpu.get('name','N/A')}**")
                     st.markdown(f"  - UUID: `{gpu.get('uuid','N/A')}`")
-                    st.markdown(f"  - Total Memory: {gpu.get('memory_total_mb', 0):.0f} MB")
+                    st.markdown(f"  - Total Memory: {gpu.get('memory_total_mb', 0) / 1024:.2f} GB")
         # else:
             # st.caption("No GPU configuration data reported by this server.") # Less prominent than info box
     elif config_data and "error" in config_data:
@@ -256,7 +203,9 @@ def display_server_data(server_info: dict, top_n_global: int):
             st.progress(int(cpu_util), text=f"CPU Usage: {cpu_util:.1f}%")
         with col_rt_summary2: # RAM Usage
             ram_util = status_data.get('ram_utilization_percent', 0.0)
-            ram_text = f"RAM: {ram_util:.1f}% ({status_data.get('ram_used_gb', 0):.2f}GB / {status_data.get('ram_total_gb', 0):.2f}GB)"
+            ram_used_gb = status_data.get('ram_used_gb', 0)
+            ram_total_gb = status_data.get('ram_total_gb', 0)
+            ram_text = f"RAM: {ram_util:.1f}% ({ram_used_gb:.2f} GB / {ram_total_gb:.2f} GB)"
             st.progress(int(ram_util), text=ram_text)
 
         st.markdown("---") # Visual separator
@@ -269,6 +218,12 @@ def display_server_data(server_info: dict, top_n_global: int):
             if cpu_processes_data and "error" not in cpu_processes_data:
                 if cpu_processes_data: # Check if list is not empty
                     df_cpu_procs = pd.DataFrame(cpu_processes_data)
+                    # Format the percentage columns for better readability
+                    if 'cpu_percent' in df_cpu_procs.columns:
+                        df_cpu_procs['cpu_percent'] = df_cpu_procs['cpu_percent'].apply(lambda x: f"{x:.2f}%")
+                    if 'memory_percent' in df_cpu_procs.columns:
+                        df_cpu_procs['memory_percent'] = df_cpu_procs['memory_percent'].apply(lambda x: f"{x:.2f}%")
+
                     cols_to_show = [col for col in ['pid', 'name', 'user', 'cpu_percent', 'memory_percent'] if col in df_cpu_procs.columns]
                     st.dataframe(df_cpu_procs[cols_to_show], use_container_width=True, hide_index=True, height=len(df_cpu_procs)*35 + 40 if len(df_cpu_procs) > 0 else 75) # Dynamic height
                 else:
@@ -288,9 +243,11 @@ def display_server_data(server_info: dict, top_n_global: int):
                                  f"(Util: {gpu.get('utilization_gpu',0):.1f}%)")
                     # Keep GPUs expanded by default or make it configurable
                     with st.expander(exp_title, expanded=True):
-                        mem_total = gpu.get('memory_total_mb', 1) # Avoid division by zero if data is malformed
-                        mem_used = gpu.get('memory_used_mb', 0)
-                        mem_util_percent = (mem_used / mem_total) * 100 if mem_total > 0 else 0
+                        mem_total_mb = gpu.get('memory_total_mb', 1) # Avoid division by zero if data is malformed
+                        mem_used_mb = gpu.get('memory_used_mb', 0)
+                        mem_util_percent = (mem_used_mb / mem_total_mb) * 100 if mem_total_mb > 0 else 0
+                        mem_total_gb = mem_total_mb / 1024
+                        mem_used_gb = mem_used_mb / 1024
 
                         # Using st.metric for GPU stats
                         gpu_metric_cols = st.columns(2)
@@ -300,17 +257,26 @@ def display_server_data(server_info: dict, top_n_global: int):
                                 st.metric(label=f"GPU {gpu.get('id','N/A')} Temp.", value=f"{gpu.get('temperature_c',0):.1f}°C")
                         with gpu_metric_cols[1]:
                             st.metric(label=f"VRAM Usage", value=f"{mem_util_percent:.1f}%",
-                                      help=f"{mem_used:.0f}MB / {mem_total:.0f}MB")
+                                      help=f"{mem_used_gb:.2f}GB / {mem_total_gb:.2f}GB")
 
-                        st.progress(int(mem_util_percent), text=f"VRAM: {mem_used:.0f}MB / {mem_total:.0f}MB ({mem_util_percent:.1f}%)")
+                        st.progress(int(mem_util_percent), text=f"VRAM: {mem_used_gb:.2f}GB / {mem_total_gb:.2f}GB ({mem_util_percent:.1f}%)")
 
                         gpu_procs = gpu.get('processes', [])
                         if gpu_procs:
                             st.markdown("**Top Processes on this GPU:**")
                             df_gpu_procs = pd.DataFrame(gpu_procs)
+                            # Format memory usage for better readability
+                            if 'gpu_memory_mb' in df_gpu_procs.columns:
+                                df_gpu_procs['gpu_memory'] = df_gpu_procs['gpu_memory_mb'].apply(lambda x: f"{x/1024:.2f} GB")
+
                             # Ensure columns exist before trying to select them
-                            cols_to_show_gpu = [col for col in ['pid', 'name', 'user', 'gpu_memory_mb'] if col in df_gpu_procs.columns]
-                            st.dataframe(df_gpu_procs[cols_to_show_gpu], use_container_width=True, hide_index=True, height=len(df_gpu_procs)*35 + 40 if len(df_gpu_procs) > 0 else 75)
+                            cols_to_show_gpu = ['pid', 'name', 'user', 'gpu_memory']
+                            if 'gpu_memory' in df_gpu_procs.columns:
+                                df_gpu_procs = df_gpu_procs[['pid', 'name', 'user', 'gpu_memory']]
+                                st.dataframe(df_gpu_procs, use_container_width=True, hide_index=True, height=len(df_gpu_procs)*35 + 40 if len(df_gpu_procs) > 0 else 75)
+                            else:
+                                cols_to_show_gpu = [col for col in ['pid', 'name', 'user', 'gpu_memory_mb'] if col in df_gpu_procs.columns]
+                                st.dataframe(df_gpu_procs[cols_to_show_gpu], use_container_width=True, hide_index=True, height=len(df_gpu_procs)*35 + 40 if len(df_gpu_procs) > 0 else 75)
                         elif top_n_global > 0 : # Only show "no processes" if we asked for them
                             st.caption(f"No top processes reported on GPU {gpu.get('id','N/A')}.")
             elif 'gpus' in status_data and not status_data['gpus']: # API reported gpus key, but it's empty
