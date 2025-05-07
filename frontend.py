@@ -3,7 +3,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import time
-from streamlit_autorefresh import st_autorefresh # Ensure this is installed: uv pip install streamlit-autorefresh
+from streamlit_autorefresh import st_autorefresh
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -15,58 +15,116 @@ st.set_page_config(
 
 st.title("🖥️ ServerMonitor Dashboard")
 
+# --- Global State Management with st.cache_resource ---
+# This dictionary will be shared across all user sessions for this Streamlit app instance.
+@st.cache_resource
+def get_global_app_state():
+    """Initializes and returns the global state dictionary."""
+    return {
+        "monitored_servers": [],  # List of {'name': str, 'url': str, 'config_cache': None}
+        "refresh_interval_label": "10s",
+        "top_n_processes": 3,
+        # 'active_tab_name': None # Active tab is best kept per-session (Streamlit's default)
+    }
+
+GLOBAL_APP_STATE = get_global_app_state()
+
+# Map refresh labels to seconds
+REFRESH_INTERVALS_MAP = {"Off": 0, "1s": 1, "5s": 5, "10s": 10, "30s": 30, "60s": 60}
+
 # --- Helper Function to Call Backend API ---
 def fetch_from_api_server(base_url: str, endpoint: str, params: dict = None):
     """Generic function to fetch data from a specific server's backend."""
     try:
-        # Ensure base_url doesn't have trailing slash and endpoint has leading slash
         url = f"{base_url.rstrip('/')}{endpoint}"
-        response = requests.get(url, params=params, timeout=10) # 10s timeout
-        response.raise_for_status()  # Raises HTTPError for bad responses (4XX or 5XX)
+        response = requests.get(url, params=params, timeout=5) # Reduced timeout for quicker feedback
+        response.raise_for_status()
         return response.json()
     except requests.exceptions.Timeout:
-        st.error(f"Timeout connecting to {base_url}{endpoint}", icon="🚨")
-        return None
+        # st.error(f"Timeout connecting to {base_url}{endpoint}", icon="🚨") # Errors shown in context
+        return {"error": f"Timeout connecting to {url}"}
     except requests.exceptions.ConnectionError:
-        st.error(f"Connection error to {base_url}{endpoint}. Is the backend server running and accessible?", icon="🚨")
-        return None
+        # st.error(f"Connection error to {base_url}{endpoint}.", icon="🚨")
+        return {"error": f"Connection error to {url}. Is the backend server running?"}
     except requests.exceptions.RequestException as e:
-        st.error(f"Error fetching data from {base_url}{endpoint}: {e}", icon="🚨")
-        return None
+        # st.error(f"Error fetching data from {base_url}{endpoint}: {e}", icon="🚨")
+        return {"error": f"Request error for {url}: {e}"}
+    except requests.exceptions.JSONDecodeError:
+        # st.error(f"Failed to decode JSON from {base_url}{endpoint}", icon="🚨")
+        return {"error": f"Failed to decode JSON from {url}"}
 
-# --- Session State Initialization ---
-if 'monitored_servers' not in st.session_state:
-    # List of dictionaries: {'name': str, 'url': str}
-    st.session_state.monitored_servers = []
-if 'active_server_tab' not in st.session_state:
-     st.session_state.active_server_tab = None
+# --- Cached Data Fetching Functions (shared across sessions) ---
+
+# Cache for server configuration (long TTL as it's mostly static)
+@st.cache_data(ttl=3600) # Cache config for 1 hour
+def get_server_config_cached(server_url: str):
+    # print(f"Fetching CONFIG from {server_url} at {time.time()}") # Debug
+    data = fetch_from_api_server(server_url, "/api/server/config")
+    if data and "error" not in data:
+        # Store this fetched config in our global state for quick access if needed,
+        # though st.cache_data handles the primary caching.
+        for srv in GLOBAL_APP_STATE["monitored_servers"]:
+            if srv["url"] == server_url:
+                srv["config_cache"] = data # Optional: update a direct cache in GLOBAL_APP_STATE
+                break
+    return data
 
 
-# --- Sidebar for Controls & Server Management ---
+def get_dynamic_cache_ttl():
+    """Calculates TTL for dynamic data based on global refresh interval."""
+    interval_seconds = REFRESH_INTERVALS_MAP.get(GLOBAL_APP_STATE["refresh_interval_label"], 0)
+    if interval_seconds > 0:
+        return max(0.5, interval_seconds * 0.9) # TTL is 90% of interval, min 0.5s
+    return 60 # Default TTL (e.g. 60s) if refresh is "Off"
+
+
+@st.cache_data(ttl=get_dynamic_cache_ttl)
+def fetch_status_cached(base_url: str, top_n_gpu_processes: int):
+    # print(f"Fetching STATUS from {base_url} (top_n_gpu={top_n_gpu_processes}) at {time.time()}") # Debug
+    return fetch_from_api_server(base_url, "/api/server/status", params={"top_n_gpu_processes": top_n_gpu_processes})
+
+@st.cache_data(ttl=get_dynamic_cache_ttl)
+def fetch_cpu_processes_cached(base_url: str, n: int):
+    # print(f"Fetching CPU_PROCS from {base_url} (n={n}) at {time.time()}") # Debug
+    return fetch_from_api_server(base_url, "/api/cpu/top_processes", params={"n": n})
+
+
+# --- Sidebar for Global Controls & Server Management ---
 st.sidebar.header("Global Controls")
 
-refresh_intervals = {"Off": 0, "1s": 1, "5s": 5, "10s": 10, "30s": 30, "60s": 60}
+# Refresh Interval
+current_refresh_label = GLOBAL_APP_STATE["refresh_interval_label"]
 selected_interval_label = st.sidebar.selectbox(
     "Refresh Interval",
-    options=list(refresh_intervals.keys()),
-    index=3,  # Default to 10 seconds
-    help="Set how often the data for the active tab(s) should refresh."
+    options=list(REFRESH_INTERVALS_MAP.keys()),
+    index=list(REFRESH_INTERVALS_MAP.keys()).index(current_refresh_label),
+    help="Global: How often to refresh data for all servers. Affects all users."
 )
-refresh_interval_seconds = refresh_intervals[selected_interval_label]
+if selected_interval_label != current_refresh_label:
+    GLOBAL_APP_STATE["refresh_interval_label"] = selected_interval_label
+    st.experimental_rerun() # Rerun to apply new interval and clear caches if TTL changes
+
+refresh_interval_seconds = REFRESH_INTERVALS_MAP[GLOBAL_APP_STATE["refresh_interval_label"]]
 
 if refresh_interval_seconds > 0:
     st_autorefresh(interval=refresh_interval_seconds * 1000, key="global_data_refresher")
 
+# Top N Processes
+current_top_n = GLOBAL_APP_STATE["top_n_processes"]
 top_n_options = [1, 2, 3, 4, 5, 10]
-top_n_processes = st.sidebar.selectbox(
+selected_top_n = st.sidebar.selectbox(
     "Top N Processes",
     options=top_n_options,
-    index=2,  # Default to Top 3
-    help="Number of top CPU/GPU processes to display for each server."
+    index=top_n_options.index(current_top_n),
+    help="Global: Number of top CPU/GPU processes to display. Affects all users."
 )
+if selected_top_n != current_top_n:
+    GLOBAL_APP_STATE["top_n_processes"] = selected_top_n
+    st.experimental_rerun()
+
 
 st.sidebar.divider()
-st.sidebar.header("Manage Servers")
+st.sidebar.header("Manage Servers (Shared List)")
 
 with st.sidebar.form("add_server_form", clear_on_submit=True):
     st.subheader("Add New Server")
@@ -76,172 +134,170 @@ with st.sidebar.form("add_server_form", clear_on_submit=True):
 
     if add_server_submitted:
         if new_server_name and new_server_url:
-            if not (new_server_url.startswith("http://") or new_server_url.startswith("https://")):
+            cleaned_url = new_server_url.strip().rstrip('/')
+            if not (cleaned_url.startswith("http://") or cleaned_url.startswith("https://")):
                 st.sidebar.error("URL must start with http:// or https://")
+            elif any(s['url'] == cleaned_url for s in GLOBAL_APP_STATE["monitored_servers"]) or \
+                 any(s['name'] == new_server_name for s in GLOBAL_APP_STATE["monitored_servers"]):
+                st.sidebar.warning("Server with this name or URL already exists.")
             else:
-                # Check for duplicates
-                if any(s['url'] == new_server_url.rstrip('/') for s in st.session_state.monitored_servers) or \
-                   any(s['name'] == new_server_name for s in st.session_state.monitored_servers):
-                    st.sidebar.warning("Server with this name or URL already exists.")
-                else:
-                    st.session_state.monitored_servers.append(
-                        {'name': new_server_name, 'url': new_server_url.rstrip('/')}
+                # Test connection before adding
+                test_config = fetch_from_api_server(cleaned_url, "/api/server/config")
+                if test_config and "error" not in test_config:
+                    GLOBAL_APP_STATE["monitored_servers"].append(
+                        {'name': new_server_name, 'url': cleaned_url, 'config_cache': test_config}
                     )
                     st.sidebar.success(f"Added server: {new_server_name}")
-                    # st.experimental_rerun() # Rerun to update tabs; form submission already does this.
+                    st.experimental_rerun()
+                else:
+                    error_msg = test_config.get('error', 'Unknown error') if isinstance(test_config, dict) else 'Unknown error'
+                    st.sidebar.error(f"Failed to connect or get config from {cleaned_url}. Error: {error_msg}")
         else:
             st.sidebar.error("Both server name and URL are required.")
 
-if st.session_state.monitored_servers:
+if GLOBAL_APP_STATE["monitored_servers"]:
     st.sidebar.subheader("Monitored Servers")
-    servers_to_remove = []
-    for i, server in enumerate(st.session_state.monitored_servers):
+    servers_to_remove_indices = []
+    for i, server in enumerate(GLOBAL_APP_STATE["monitored_servers"]):
         col1, col2 = st.sidebar.columns([0.8, 0.2])
-        col1.text(f"{server['name']}\n({server['url']})")
+        col1.text(f"{server['name']} ({server['url']})")
         if col2.button("🗑️", key=f"remove_server_{i}", help=f"Remove {server['name']}"):
-            servers_to_remove.append(i)
+            servers_to_remove_indices.append(i)
 
-    if servers_to_remove:
-        # Remove in reverse order to avoid index issues
-        for i in sorted(servers_to_remove, reverse=True):
-            removed_server = st.session_state.monitored_servers.pop(i)
+    if servers_to_remove_indices:
+        for i in sorted(servers_to_remove_indices, reverse=True):
+            removed_server = GLOBAL_APP_STATE["monitored_servers"].pop(i)
             st.sidebar.toast(f"Removed server: {removed_server['name']}")
-        if not st.session_state.monitored_servers: # If last server removed
-            st.session_state.active_server_tab = None
-        elif st.session_state.active_server_tab not in [s['name'] for s in st.session_state.monitored_servers]:
-            # If active tab was removed, reset (or set to first available)
-             st.session_state.active_server_tab = st.session_state.monitored_servers[0]['name'] if st.session_state.monitored_servers else None
         st.experimental_rerun()
 
 
-# --- Cached Data Fetching Functions ---
-@st.cache_data(ttl=300) # Cache for 5 minutes per server_url
-def get_server_config_cached(server_url: str):
-    return fetch_from_api_server(server_url, "/api/server/config")
-
 # --- Main Display Area for Servers ---
-def display_server_data(server_info: dict, top_n: int):
+def display_server_data(server_info: dict, top_n_global: int):
     """Displays monitoring data for a single server."""
     base_url = server_info['url']
     server_name = server_info['name']
 
     # --- Server Configuration Section ---
-    st.subheader(f"⚙️ Configuration Details", anchor=False)
-    config_data = get_server_config_cached(base_url) # Use cached version
+    st.subheader(f"⚙️ {server_name} - Configuration", anchor=False)
+    config_data = get_server_config_cached(base_url) # Uses st.cache_data
 
-    if config_data:
-        col_cfg1, col_cfg2 = st.columns(2)
+    if config_data and "error" not in config_data:
+        col_cfg1, col_cfg2 = st.columns([1,1]) # Use 2 columns for config
         with col_cfg1:
-            st.markdown(f"**Server Name:** `{config_data['server_name']}`")
-            st.markdown(f"**Server IP:** `{config_data['server_ip']}`")
-            st.markdown(f"**Total RAM:** {config_data['memory_total_gb']:.2f} GB")
-
+            st.markdown(f"**Backend Name:** `{config_data.get('server_name', 'N/A')}`")
+            st.markdown(f"**Backend IP:** `{config_data.get('server_ip', 'N/A')}`")
         with col_cfg2:
-            with st.expander("CPU Configuration", expanded=False):
-                st.markdown(f"- **Model:** {config_data['cpus']['model_name']}")
-                st.markdown(f"- **Physical Cores:** {config_data['cpus']['physical_cores']}")
-                st.markdown(f"- **Logical Cores:** {config_data['cpus']['logical_cores']}")
+            st.markdown(f"**Total RAM:** {config_data.get('memory_total_gb', 0):.2f} GB")
 
-        if config_data['gpus']:
-            with st.expander("GPU Configuration", expanded=False):
-                for i, gpu in enumerate(config_data['gpus']):
-                    st.markdown(f"--- \n **GPU {gpu['id']}: {gpu['name']}**")
-                    st.markdown(f"  - UUID: `{gpu['uuid']}`")
-                    st.markdown(f"  - Total Memory: {gpu['memory_total_mb']:.0f} MB")
+        exp_cpu_cfg = st.expander("CPU Configuration", expanded=False)
+        cpus_cfg = config_data.get('cpus', {})
+        exp_cpu_cfg.markdown(f"- **Model:** {cpus_cfg.get('model_name', 'N/A')}")
+        exp_cpu_cfg.markdown(f"- **Physical Cores:** {cpus_cfg.get('physical_cores', 'N/A')}")
+        exp_cpu_cfg.markdown(f"- **Logical Cores:** {cpus_cfg.get('logical_cores', 'N/A')}")
+
+        gpus_cfg = config_data.get('gpus', [])
+        if gpus_cfg:
+            exp_gpu_cfg = st.expander("GPU Configuration", expanded=False)
+            for i, gpu in enumerate(gpus_cfg):
+                exp_gpu_cfg.markdown(f"--- \n **GPU {gpu.get('id','N/A')}: {gpu.get('name','N/A')}**")
+                exp_gpu_cfg.markdown(f"  - UUID: `{gpu.get('uuid','N/A')}`")
+                exp_gpu_cfg.markdown(f"  - Total Memory: {gpu.get('memory_total_mb', 0):.0f} MB")
         else:
-            st.info("No GPUs detected in configuration or `nvidia-smi` might not be available on the server.")
+            st.info("No GPUs detected in server configuration.", icon="ℹ️")
     else:
-        st.warning(f"Could not load server configuration for {server_name}. The server might be offline or the API endpoint is incorrect.", icon="⚠️")
-        return # Stop further display for this server if config fails
+        err_msg = config_data.get('error', 'Failed to load configuration') if isinstance(config_data, dict) else "Failed to load configuration"
+        st.warning(f"Could not load server configuration for {server_name}: {err_msg}", icon="⚠️")
+        return
 
     st.divider()
 
     # --- Real-time Status Section ---
-    st.subheader("📊 Real-time Resource Usage", anchor=False)
-    status_data = fetch_from_api_server(base_url, "/api/server/status", params={"top_n_gpu_processes": top_n})
+    st.subheader(f"📊 {server_name} - Real-time Usage", anchor=False)
+    status_data = fetch_status_cached(base_url, top_n_global) # Uses st.cache_data
 
-    if status_data:
-        layout_cols = st.columns([1, 1]) # For CPU/RAM summary
-        with layout_cols[0]: # CPU Usage
-            cpu_util = status_data['cpu_utilization_percent']
+    if status_data and "error" not in status_data:
+        col_rt_summary1, col_rt_summary2 = st.columns(2)
+        with col_rt_summary1: # CPU Usage
+            cpu_util = status_data.get('cpu_utilization_percent', 0.0)
             st.progress(int(cpu_util), text=f"CPU Utilization: {cpu_util:.1f}%")
-        with layout_cols[1]: # RAM Usage
-            ram_util = status_data['ram_utilization_percent']
-            ram_text = f"RAM: {ram_util:.1f}% ({status_data['ram_used_gb']:.2f} GB / {status_data['ram_total_gb']:.2f} GB)"
+        with col_rt_summary2: # RAM Usage
+            ram_util = status_data.get('ram_utilization_percent', 0.0)
+            ram_text = f"RAM: {ram_util:.1f}% ({status_data.get('ram_used_gb', 0):.2f}GB / {status_data.get('ram_total_gb', 0):.2f}GB)"
             st.progress(int(ram_util), text=ram_text)
 
-        st.markdown("---") # Visual separator
+        st.markdown("---")
 
-        # Detailed CPU and GPU Usage
         detail_cols = st.columns(2)
         with detail_cols[0]:
-            st.subheader("🚀 CPU Top Processes", anchor=False)
-            cpu_processes_data = fetch_from_api_server(base_url, "/api/cpu/top_processes", params={"n": top_n})
-            if cpu_processes_data is not None:
-                if cpu_processes_data: # If list is not empty
+            st.markdown("##### <p style='text-align: center;'>🚀 CPU Top Processes</p>", unsafe_allow_html=True)
+            cpu_processes_data = fetch_cpu_processes_cached(base_url, top_n_global) # Uses st.cache_data
+            if cpu_processes_data and "error" not in cpu_processes_data:
+                if cpu_processes_data:
                     df_cpu_procs = pd.DataFrame(cpu_processes_data)
-                    df_cpu_procs = df_cpu_procs[['pid', 'name', 'user', 'cpu_percent', 'memory_percent']]
-                    st.dataframe(df_cpu_procs, use_container_width=True, hide_index=True)
+                    # Ensure columns exist before selecting
+                    cols_to_show = [col for col in ['pid', 'name', 'user', 'cpu_percent', 'memory_percent'] if col in df_cpu_procs.columns]
+                    st.dataframe(df_cpu_procs[cols_to_show], use_container_width=True, hide_index=True, height=180) # Adjust height
                 else:
-                    st.info("No significant CPU processes found or reported.")
+                    st.info("No significant CPU processes found.", icon="ℹ️")
             else:
-                st.warning("Could not load CPU top processes data.", icon="⚠️")
+                err_msg = cpu_processes_data.get('error',"N/A") if isinstance(cpu_processes_data, dict) else "N/A"
+                st.warning(f"CPU top processes data unavailable: {err_msg}", icon="⚠️")
 
         with detail_cols[1]:
-            st.subheader("🎮 GPU(s) Detailed Status", anchor=False)
-            if status_data.get('gpus'):
-                for i, gpu in enumerate(status_data['gpus']):
-                    exp_title = (f"GPU {gpu['id']}: {gpu['name']} "
-                                 f"(Util: {gpu['utilization_gpu']:.1f}%)")
-                    with st.expander(exp_title, expanded=True):
-                        mem_util = (gpu['memory_used_mb'] / gpu['memory_total_mb']) * 100 if gpu['memory_total_mb'] > 0 else 0
+            st.markdown("##### <p style='text-align: center;'>🎮 GPU(s) Detailed Status</p>", unsafe_allow_html=True)
+            gpus_status_list = status_data.get('gpus', [])
+            if gpus_status_list:
+                for i, gpu in enumerate(gpus_status_list):
+                    exp_title = (f"GPU {gpu.get('id','N/A')}: {gpu.get('name','N/A')} "
+                                 f"(Util: {gpu.get('utilization_gpu',0):.1f}%)")
+                    with st.expander(exp_title, expanded=True): # Keep GPUs expanded by default
+                        mem_total = gpu.get('memory_total_mb', 1) # Avoid division by zero
+                        mem_used = gpu.get('memory_used_mb', 0)
+                        mem_util = (mem_used / mem_total) * 100 if mem_total > 0 else 0
 
-                        gpu_cols = st.columns(2)
-                        with gpu_cols[0]:
-                            st.metric(label=f"GPU {gpu['id']} Utilization", value=f"{gpu['utilization_gpu']:.1f}%")
+                        gpu_metric_cols = st.columns(2)
+                        with gpu_metric_cols[0]:
+                            st.metric(label=f"GPU {gpu.get('id','N/A')} Utilization", value=f"{gpu.get('utilization_gpu',0):.1f}%")
                             if gpu.get('temperature_c') is not None:
-                                st.metric(label=f"GPU {gpu['id']} Temperature", value=f"{gpu['temperature_c']:.1f}°C")
-                        with gpu_cols[1]:
-                            st.metric(label=f"GPU {gpu['id']} VRAM Usage", value=f"{mem_util:.1f}%",
-                                      help=f"{gpu['memory_used_mb']:.0f} MB / {gpu['memory_total_mb']:.0f} MB")
+                                st.metric(label=f"GPU {gpu.get('id','N/A')} Temp.", value=f"{gpu.get('temperature_c',0):.1f}°C")
+                        with gpu_metric_cols[1]:
+                            st.metric(label=f"VRAM Usage", value=f"{mem_util:.1f}%",
+                                      help=f"{mem_used:.0f}MB / {mem_total:.0f}MB")
+                        st.progress(int(mem_util), text=f"VRAM: {mem_used:.0f}MB / {mem_total:.0f}MB")
 
-                        st.progress(int(mem_util), text=f"VRAM: {gpu['memory_used_mb']:.0f}MB / {gpu['memory_total_mb']:.0f}MB")
-
-                        if gpu.get('processes'):
+                        gpu_procs = gpu.get('processes', [])
+                        if gpu_procs:
                             st.markdown("**Top Processes on this GPU:**")
-                            df_gpu_procs = pd.DataFrame([p for p in gpu['processes']]) # Ensure it's a list of dicts
-                            df_gpu_procs = df_gpu_procs[['pid', 'name', 'user', 'gpu_memory_mb']]
-                            st.dataframe(df_gpu_procs, use_container_width=True, hide_index=True)
-                        elif top_n > 0 : # Only show if user expects processes
-                            st.info(f"No active processes found on GPU {gpu['id']} meeting criteria.")
-            elif 'gpus' in status_data and not status_data['gpus']: # API returned gpus: []
-                 st.info("No GPUs detected or reported by the server's API.")
-            else: # Fallback if 'gpus' key missing or other issue with status_data for gpus
-                st.info("GPU status not available or no GPUs detected on this server.")
+                            df_gpu_procs = pd.DataFrame(gpu_procs)
+                            cols_to_show_gpu = [col for col in ['pid', 'name', 'user', 'gpu_memory_mb'] if col in df_gpu_procs.columns]
+                            st.dataframe(df_gpu_procs[cols_to_show_gpu], use_container_width=True, hide_index=True, height=150) # Adjust height
+                        elif top_n_global > 0:
+                            st.caption(f"No top processes reported on GPU {gpu.get('id','N/A')}.")
+            elif 'gpus' in status_data and not status_data['gpus']:
+                 st.info("No GPUs detected or reported by the server's API for real-time status.", icon="ℹ️")
+            else:
+                st.info("GPU status not available or no GPUs detected on this server.", icon="ℹ️")
     else:
-        st.error(f"Could not load real-time status for {server_name}. The server might be offline or experiencing issues.", icon="🚨")
+        err_msg = status_data.get('error', 'Failed to load real-time status') if isinstance(status_data, dict) else "Failed to load real-time status"
+        st.error(f"Could not load real-time status for {server_name}: {err_msg}", icon="🚨")
 
 
-if not st.session_state.monitored_servers:
-    st.info("👋 Welcome to ServerMonitor! Please add servers using the 'Manage Servers' section in the sidebar to begin monitoring.")
+# --- Main Application Logic ---
+if not GLOBAL_APP_STATE["monitored_servers"]:
+    st.info("👋 Welcome to ServerMonitor! Please add servers using the 'Manage Servers' section in the sidebar to begin monitoring. All users will see the same list of servers and global settings.")
 else:
-    tab_titles = [s['name'] for s in st.session_state.monitored_servers]
+    tab_titles = [s['name'] for s in GLOBAL_APP_STATE["monitored_servers"]]
 
-    # Handle tab selection persistence if needed, though Streamlit tabs reset selection on most actions
-    # For simplicity, default to first tab or last known if still valid
-    if st.session_state.active_server_tab not in tab_titles and tab_titles:
-        st.session_state.active_server_tab = tab_titles[0]
-
-    # Create tabs. The `st.tabs` function itself doesn't have a default selected index parameter directly.
-    # It activates the first tab by default.
+    # Streamlit's st.tabs remembers the last selected tab *per session* by default.
+    # If a tab (server) is removed, Streamlit handles this by selecting the first tab.
     created_tabs = st.tabs(tab_titles)
 
     for i, tab_widget in enumerate(created_tabs):
         with tab_widget:
-            current_server_info = st.session_state.monitored_servers[i]
-            # Update active tab name based on which tab is currently being rendered by Streamlit
-            # This is more for logical tracking if we needed it, st.tabs handles display.
-            # st.session_state.active_server_tab = current_server_info['name']
-
-            # Display data for the server associated with this tab
-            display_server_data(current_server_info, top_n_processes)
+            # Check if server index is still valid (e.g., if a server was removed by another user session)
+            if i < len(GLOBAL_APP_STATE["monitored_servers"]):
+                current_server_info = GLOBAL_APP_STATE["monitored_servers"][i]
+                display_server_data(current_server_info, GLOBAL_APP_STATE["top_n_processes"])
+            else:
+                st.warning("This server tab is no longer valid, possibly removed. Please refresh or select another tab.", icon="⚠️")
+                # This state should ideally be rare due to reruns on server list changes.
